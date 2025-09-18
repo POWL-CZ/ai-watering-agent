@@ -1,281 +1,52 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import base64, json, os, sys, mimetypes, logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-from typing import Optional
-
-from zoneinfo import ZoneInfo
-from pydantic import BaseModel, ValidationError
-from openai import OpenAI
-
-# ---------- Hardcoded cesty & nastavení ----------
-IMAGE_PATH = "./plant.jpg"
-WEATHER_NOW_PATH = "./weather_now.json"
-WEATHER_FORECAST_PATH = "./weather_forecast.json"
-HISTORY_PATH = "./watering_history.json"
-PLANT_PATH = "./plant.json"
-LOGFILE = "./watering.log"
-
-ROTATE_MAX_MB = 5
-ROTATE_BACKUPS = 3
-MODEL = "gpt-4o-mini"
-LOCAL_TZ = ZoneInfo("Europe/Prague")
-
-# log celého promptu (bez base64 obrázku)
-LOG_PROMPT_INCLUDE_IMAGE = False
-
-# ---------- Pydantic ----------
-class WeatherNow(BaseModel):
-    temp_c: float
-    humidity_pct: Optional[float] = None
-    precipitation_mm: Optional[float] = None
-    cloudcover_pct: Optional[float] = None
-    description: Optional[str] = None
-
-class WeatherForecastItem(BaseModel):
-    time: datetime
-    precip_prob_pct: Optional[float] = None
-    expected_precip_mm: Optional[float] = None
-    temp_c: Optional[float] = None
-    humidity_pct: Optional[float] = None
-
-class WeatherForecast(BaseModel):
-    items: list[WeatherForecastItem]
-
-class PlantContext(BaseModel):
-    species: Optional[str] = None
-    notes: Optional[str] = None
-
-class DecisionRequest(BaseModel):
-    image_url: str
-    last_watering_date: Optional[str] = None
-    last_watering_amount_ml: Optional[int] = None
-    weather_now: WeatherNow
-    weather_forecast: WeatherForecast
-    plant: Optional[PlantContext] = None
-
-class DecisionResponse(BaseModel):
-    zalevat: bool
-    oduvodneni: str
-
-# ---------- Pomůcky ----------
-def file_to_data_url(path: str) -> str:
-    mime, _ = mimetypes.guess_type(path)
-    if not mime or not mime.startswith("image/"):
-        raise ValueError(f"Soubor '{path}' musí být obrázek (image/*).")
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
-    return f"data:{mime};base64,{b64}"
-
-def load_json_or_default(path: str, default, required: bool = False):
-    if not os.path.exists(path):
-        if required:
-            raise FileNotFoundError(f"Soubor '{path}' neexistuje.")
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def days_since(date_str: Optional[str]) -> Optional[int]:
-    if not date_str:
-        return None
-    try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00")).astimezone(LOCAL_TZ).date()
-        return (datetime.now(LOCAL_TZ).date() - dt).days
-    except Exception:
-        return None
-
-def precip_sum_next_hours(forecast: WeatherForecast, hours: int) -> float:
-    now = datetime.now(LOCAL_TZ)
-    end = now + timedelta(hours=hours)
-    total = 0.0
-    for it in forecast.items:
-        t = it.time
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=LOCAL_TZ)
-        else:
-            t = t.astimezone(LOCAL_TZ)
-        if now <= t <= end and it.expected_precip_mm is not None:
-            total += float(it.expected_precip_mm)
-    return total
-
-# ---------- Prompt ----------
-def build_messages(payload: DecisionRequest) -> list:
-    today_label = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-
-    # tvrdá fakta pro model
-    dsl = days_since(payload.last_watering_date)
-    rain12 = precip_sum_next_hours(payload.weather_forecast, 12)
-    facts = {
-        "days_since_last_watering": dsl,
-        "last_watering_amount_ml": payload.last_watering_amount_ml,
-        "rain_next_12h_mm": round(rain12, 1),
-        "now_temp_c": payload.weather_now.temp_c,
-        "now_rh_pct": payload.weather_now.humidity_pct
-    }
-
-    system = (
-        f"Dnes je {today_label}. "
-        "Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: "
-        "(1) fotka – známky přemokření/usušení, "
-        "(2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), "
-        "(3) dnešní teplota a vlhkost (odpar), "
-        "(4) srážky do 12 h. "
-        "Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, "
-        "pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). "
-        "Jinak zvol zalít. "
-        "Odpověz **jen** jako JSON: "
-        '{"zalevat": <true|false>, "oduvodneni": "<stručné, konkrétní: dny/°C/%/mm>"} '
-        "Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
-    )
-
-    user_text = (
-        f"FAKTA: {facts}\n\n"
-        f"Poslední zálivka (ISO): {payload.last_watering_date} "
-        f"({payload.last_watering_amount_ml or 'neznámý'} ml)\n\n"
-        f"Kontext rostliny: {payload.plant.model_dump_json() if payload.plant else 'neznámý'}\n\n"
-        f"Aktuální počasí: {payload.weather_now.model_dump()}\n\n"
-        f"Předpověď (prvních 12): {[i.model_dump() for i in payload.weather_forecast.items[:12]]}"
-    )
-
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": payload.image_url}},
-        ]},
-    ]
-
-def serialize_messages_for_log(messages: list, include_image: bool) -> str:
-    def scrub(o):
-        if isinstance(o, dict):
-            d = {}
-            for k, v in o.items():
-                if k == "image_url" and isinstance(v, dict) and "url" in v and not include_image:
-                    d[k] = {"url": "<image-data-url-redacted>"}
-                else:
-                    d[k] = scrub(v)
-            return d
-        if isinstance(o, list): return [scrub(x) for x in o]
-        return o
-    return json.dumps(scrub(messages), ensure_ascii=False, indent=2)
-
-# ---------- Volání modelu ----------
-def call_openai(messages: list, model: str) -> DecisionResponse:
-    logging.info("PROMPT_MESSAGES:\n%s", serialize_messages_for_log(messages, LOG_PROMPT_INCLUDE_IMAGE))
-    client = OpenAI()
-    resp = client.chat.completions.create(
-        model=model, messages=messages, temperature=0.0,
-        response_format={"type": "json_object"}, max_tokens=400,
-    )
-    data = json.loads(resp.choices[0].message.content)
-    return DecisionResponse(**data)
-
-# ---------- Logging ----------
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    sh = logging.StreamHandler(sys.stderr)
-    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    fh = RotatingFileHandler(LOGFILE, maxBytes=ROTATE_MAX_MB*1024*1024,
-                             backupCount=ROTATE_BACKUPS, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.handlers = [sh, fh]
-
-# ---------- Konzistenční pojistka ----------
-def consistency_guard(req: DecisionRequest, res: DecisionResponse) -> DecisionResponse:
-    dsl = days_since(req.last_watering_date) or 999
-    temp = req.weather_now.temp_c
-    rh = req.weather_now.humidity_pct if req.weather_now.humidity_pct is not None else 100
-    rain12 = precip_sum_next_hours(req.weather_forecast, 12)
-
-    hot = temp >= 30.0
-    dry = rh <= 40.0
-    soon_rain = rain12 >= 2.0  # “výraznější” déšť do 12 h
-
-    # Pokud je horko + sucho + min. 1 den od poslední zálivky + žádný výrazný déšť a model řekl NE,
-    # přiklonit se k ANO s krátkým vysvětlením.
-    if hot and dry and dsl >= 1 and not soon_rain and res.zalevat is False:
-        res.zalevat = True
-        res.oduvodneni = f"{dsl} d od zálivky, {temp:.0f}°C/{int(rh)}% RH, déšť <2 mm/12h → raději zalij."
-    return res
-
-# ---------- Hlavní ----------
-def main():
-    setup_logging()
-
-    if not os.getenv("OPENAI_API_KEY"):
-        logging.error("Chybí OPENAI_API_KEY v prostředí.")
-        sys.exit(1)
-
-    # obrázek → data URL
-    try:
-        image_data_url = file_to_data_url(IMAGE_PATH)
-    except Exception as e:
-        logging.error("Chyba při čtení obrázku: %s", e)
-        sys.exit(1)
-
-    # JSON vstupy
-    try:
-        weather_now_raw = load_json_or_default(WEATHER_NOW_PATH, None, required=True)
-        weather_forecast_raw = load_json_or_default(WEATHER_FORECAST_PATH, None, required=True)
-        plant_raw = load_json_or_default(PLANT_PATH, None, required=False)
-        history_raw = load_json_or_default(HISTORY_PATH, [], required=False)
-    except Exception as e:
-        logging.error("Chyba při načítání JSON: %s", e); sys.exit(1)
-
-    # validace + “poslední zálivka”
-    try:
-        wn = WeatherNow(**weather_now_raw)
-        wf = WeatherForecast(**weather_forecast_raw)
-        plant = PlantContext(**plant_raw) if plant_raw else None
-
-        last_date = None; last_amount = None
-        if history_raw:
-            last = max(history_raw, key=lambda e: e.get("date",""))
-            last_date = last.get("date")
-            last_amount = last.get("amount_ml")
-
-        req = DecisionRequest(
-            image_url=image_data_url,
-            last_watering_date=last_date,
-            last_watering_amount_ml=last_amount,
-            weather_now=wn,
-            weather_forecast=wf,
-            plant=plant
-        )
-    except ValidationError as e:
-        logging.error("Neplatná data: %s", e); sys.exit(1)
-
-    messages = build_messages(req)
-
-    try:
-        res = call_openai(messages, model=MODEL)
-    except Exception as e:
-        logging.error("Chyba volání OpenAI: %s", e); sys.exit(1)
-
-    # konzistenční pojistka
-    #res = consistency_guard(req, res)
-
-    # výstup
-    print(json.dumps(res.model_dump(), ensure_ascii=False, indent=2))
-    logging.info("RESPONSE: %s", json.dumps(res.model_dump(), ensure_ascii=False))
-
-if __name__ == "__main__":
-    main()
-2025-09-18 23:13:39,091 [INFO] PROMPT_MESSAGES:
+2025-09-18 21:45:10,013 [ERROR] Chybí OPENAI_API_KEY v prostředí.
+2025-09-18 21:50:01,455 [ERROR] Chybí OPENAI_API_KEY v prostředí.
+2025-09-18 21:50:25,617 [ERROR] Chybí OPENAI_API_KEY v prostředí.
+2025-09-18 21:51:39,009 [ERROR] Chybí OPENAI_API_KEY v prostředí.
+2025-09-18 22:16:28,061 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 429 Too Many Requests"
+2025-09-18 22:16:28,062 [INFO] Retrying request to /chat/completions in 0.464527 seconds
+2025-09-18 22:16:30,101 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 429 Too Many Requests"
+2025-09-18 22:16:30,102 [INFO] Retrying request to /chat/completions in 0.760396 seconds
+2025-09-18 22:16:32,773 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 429 Too Many Requests"
+2025-09-18 22:16:32,774 [ERROR] Chyba volání OpenAI: Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.', 'type': 'insufficient_quota', 'param': None, 'code': 'insufficient_quota'}}
+2025-09-18 22:20:09,663 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:20:09,677 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:20:09,677 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Půdní vlhkost je na 35 %, což naznačuje potřebu zálivky. Poslední zálivka byla před 5 dny a očekávané srážky jsou minimální."}
+2025-09-18 22:21:41,271 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:21:41,288 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:21:41,288 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla naposledy zalita před 3 dny a aktuální počasí je příznivé s nízkou pravděpodobností srážek. Vzhledem k tomu, že poslední zálivka byla dostatečná, není potřeba zalévat."}
+2025-09-18 22:23:08,503 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:23:08,516 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:23:08,517 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla naposledy zalévána před 5 dny a aktuální počasí je příznivé s očekávanými srážkami v následujících 48 hodinách. Není potřeba zalévat."}
+2025-09-18 22:31:56,293 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:31:56,304 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:31:56,304 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla zalita před 3 dny a očekává se déšť během dne. Aktuální vlhkost vzduchu je 60%, což naznačuje, že rostlina pravděpodobně nepotřebuje další zálivku."}
+2025-09-18 22:32:52,450 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:32:52,464 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:32:52,464 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla zalita před 3 dny a aktuální vlhkost vzduchu je 60%. Očekávané srážky nejsou významné, ale vzhledem k předchozím zálivkám a aktuálním podmínkám není potřeba zalévat."}
+2025-09-18 22:34:40,119 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:34:40,132 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:34:40,133 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla zalita před 3 dny a aktuální počasí je slunečné s nízkou vlhkostí. Očekávané srážky nejsou dostatečné, ale rostlina by měla být schopna přežít bez další zálivky."}
+2025-09-18 22:35:52,373 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:35:52,387 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:35:52,387 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Před 8 dny byla zálivka 2500 ml a aktuální počasí je slunečné s nízkou vlhkostí. Očekávané srážky jsou také nízké, takže rostlina by měla mít dostatek vody."}
+2025-09-18 22:41:10,028 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:41:10,038 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:41:10,039 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Teplota 32°C a vlhkost 30% naznačují sucho. Poslední zálivka před 8 dny, 2500 ml. Doporučuji zalít, než se ochladí."}
+2025-09-18 22:45:47,025 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:45:47,039 [INFO] FILES: {"image": "./plant.jpg", "weather_now": "./weather_now.json", "weather_forecast": "./weather_forecast.json", "history": "./watering_history.json", "plant": "./plant.json"}
+2025-09-18 22:45:47,039 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Teplota 32°C, vlhkost 30%, 5 dní od poslední zálivky 6000 ml. Předpověď srážek 20% za 13 h, doporučuji počkat."}
+2025-09-18 22:55:35,161 [INFO] PROMPT_MESSAGES:
 [
   {
     "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní: dny/°C/%/mm>\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
+    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
   },
   {
     "role": "user",
     "content": [
       {
         "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 32.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
+        "text": "Poslední zálivka: 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: neznámý\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
       },
       {
         "type": "image_url",
@@ -286,20 +57,20 @@ if __name__ == "__main__":
     ]
   }
 ]
-2025-09-18 23:13:43,119 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:13:43,132 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "1 den/32.0 °C/30%/0.0 mm"}
-2025-09-18 23:15:51,023 [INFO] PROMPT_MESSAGES:
+2025-09-18 22:55:39,546 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 22:55:39,555 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla zalita včera a aktuální počasí je teplé a suché, což naznačuje, že by mohla mít dostatek vody."}
+2025-09-18 23:01:40,547 [INFO] PROMPT_MESSAGES:
 [
   {
     "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
+    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
   },
   {
     "role": "user",
     "content": [
       {
         "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 32.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
+        "text": "Poslední zálivka: 2025-09-15T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":null}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
       },
       {
         "type": "image_url",
@@ -310,20 +81,20 @@ if __name__ == "__main__":
     ]
   }
 ]
-2025-09-18 23:15:57,314 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:15:57,326 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Horko (32 °C) a suchý vzduch (30 % RH), poslední zálivka před 1 dnem s velkým objemem (3000 ml) a žádný déšť."}
-2025-09-18 23:25:37,170 [INFO] PROMPT_MESSAGES:
+2025-09-18 23:01:44,804 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 23:01:44,818 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Vysoké teploty a nízká vlhkost vzduchu vyžadují další zálivku."}
+2025-09-18 23:02:16,550 [INFO] PROMPT_MESSAGES:
 [
   {
     "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
+    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
   },
   {
     "role": "user",
     "content": [
       {
         "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 10.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 10.0, 'humidity_pct': 30.0, 'precipitation_mm': 3.0, 'cloudcover_pct': 60.0, 'description': 'oblacno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
+        "text": "Poslední zálivka: 2025-09-15T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
       },
       {
         "type": "image_url",
@@ -334,20 +105,20 @@ if __name__ == "__main__":
     ]
   }
 ]
-2025-09-18 23:25:40,906 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:25:40,915 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Teplota 10 °C a vlhkost 30 % naznačují, že rostlina potřebuje vodu, zejména po zálivce před 1 dnem."}
-2025-09-18 23:26:15,199 [INFO] PROMPT_MESSAGES:
+2025-09-18 23:02:22,091 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 23:02:22,104 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Rostliny potřebují vodu při vysokých teplotách a nízké vlhkosti, navíc poslední zálivka byla před třemi dny."}
+2025-09-18 23:03:45,592 [INFO] PROMPT_MESSAGES:
 [
   {
     "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
+    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
   },
   {
     "role": "user",
     "content": [
       {
         "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 10.0, 'now_rh_pct': 80.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 10.0, 'humidity_pct': 80.0, 'precipitation_mm': 3.0, 'cloudcover_pct': 60.0, 'description': 'oblacno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
+        "text": "Poslední zálivka: 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
       },
       {
         "type": "image_url",
@@ -358,77 +129,5 @@ if __name__ == "__main__":
     ]
   }
 ]
-2025-09-18 23:26:19,760 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:26:19,769 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Teplota je nízká (10 °C) a vlhkost vysoká (80 %), poslední zálivka byla včera s velkým objemem (3000 ml)."}
-2025-09-18 23:28:09,376 [INFO] PROMPT_MESSAGES:
-[
-  {
-    "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 22.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 22.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 60.0, 'description': 'oblacno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 80.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 82.0}]"
-      },
-      {
-        "type": "image_url",
-        "image_url": {
-          "url": "<image-data-url-redacted>"
-        }
-      }
-    ]
-  }
-]
-2025-09-18 23:28:15,092 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:28:15,101 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Poslední zálivka byla před 1 dnem s objemem 3000 ml, teplota je 22 °C a vlhkost 30 %, což naznačuje potřebu zalít."}
-2025-09-18 23:29:53,357 [INFO] PROMPT_MESSAGES:
-[
-  {
-    "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky do 12 h. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 22.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 22.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 60.0, 'description': 'oblacno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 80.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 82.0}]"
-      },
-      {
-        "type": "image_url",
-        "image_url": {
-          "url": "<image-data-url-redacted>"
-        }
-      }
-    ]
-  }
-]
-2025-09-18 23:29:57,899 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:29:57,912 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Poslední zálivka byla před 1 dnem s objemem 3000 ml, teplota je 22 °C a vlhkost 30 %, což naznačuje potřebu zalít."}
-2025-09-18 23:32:57,719 [INFO] PROMPT_MESSAGES:
-[
-  {
-    "role": "system",
-    "content": "Dnes je 2025-09-18 ráno. Rozhodni, zda **dnes** zalít rostlinu. POVINNÝ checklist: (1) fotka – známky přemokření/usušení, (2) DNY OD POSLEDNÍ ZÁLIVKY a POSLEDNÍ OBJEM (použij přesně tato FAKTA), (3) dnešní teplota a vlhkost (odpar), (4) srážky z předpovědi počasí na příštích 12 hodin. Pokud z faktů vyplývá horko (≥30 °C) a suchý vzduch (≤40 % RH) a poslední zálivka ≥1 den a déšť <2 mm/12 h, pak nezalévat lze jen s JASNÝM důvodem (např. velmi velká dávka včera, blízký výrazný déšť). Jinak zvol zalít. Odpověz **jen** jako JSON: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné, konkrétní\"} Nesmíš si odporovat (např. horko+sucho bez brzkého deště a přesto nezalévat bez důvodu)."
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "FAKTA: {'days_since_last_watering': 1, 'last_watering_amount_ml': 3000, 'rain_next_12h_mm': 0.0, 'now_temp_c': 22.0, 'now_rh_pct': 30.0}\n\nPoslední zálivka (ISO): 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 22.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 60.0, 'description': 'oblacno'}\n\nPředpověď (prvních 12): [{'time': datetime.datetime(2025, 9, 18, 12, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 80.0}, {'time': datetime.datetime(2025, 9, 18, 18, 0), 'precip_prob_pct': 100.0, 'expected_precip_mm': 30.0, 'temp_c': 16.0, 'humidity_pct': 82.0}]"
-      },
-      {
-        "type": "image_url",
-        "image_url": {
-          "url": "<image-data-url-redacted>"
-        }
-      }
-    ]
-  }
-]
-2025-09-18 23:33:01,905 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:33:01,918 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Předpověď deště v příštích 12 hodinách je 30 mm, což je dostatečné pro zavlažení rostlin."}
+2025-09-18 23:03:50,350 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-09-18 23:03:50,359 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla naposledy zalita včera a aktuální počasí je velmi teplé a suché, což naznačuje, že by mohla být dostatečně zavlažena."}
