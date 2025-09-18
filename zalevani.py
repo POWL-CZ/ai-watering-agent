@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ValidationError
 from openai import OpenAI
 
-# ---------- Hardcoded cesty & nastavení ----------
+# ---------- Hardcoded paths & settings ---------
 IMAGE_PATH = "./plant.jpg"
 WEATHER_NOW_PATH = "./weather_now.json"
 WEATHER_FORECAST_PATH = "./weather_forecast.json"
@@ -23,7 +23,7 @@ ROTATE_BACKUPS = 3
 MODEL = "gpt-4o-mini"
 LOCAL_TZ = ZoneInfo("Europe/Prague")
 
-# log celého promptu (bez base64 obrázku)
+# prompt log settings (w/o base64 picture)
 LOG_PROMPT_INCLUDE_IMAGE = False
 
 # ---------- Pydantic ----------
@@ -60,7 +60,7 @@ class DecisionResponse(BaseModel):
     zalevat: bool
     oduvodneni: str
 
-# ---------- Pomůcky ----------
+# ---------- Helpers ----------
 def file_to_data_url(path: str) -> str:
     mime, _ = mimetypes.guess_type(path)
     if not mime or not mime.startswith("image/"):
@@ -161,7 +161,7 @@ def serialize_messages_for_log(messages: list, include_image: bool) -> str:
         return o
     return json.dumps(scrub(messages), ensure_ascii=False, indent=2)
 
-# ---------- Volání modelu ----------
+# ---------- Open AI API Call ----------
 def call_openai(messages: list, model: str) -> DecisionResponse:
     logging.info("PROMPT_MESSAGES:\n%s", serialize_messages_for_log(messages, LOG_PROMPT_INCLUDE_IMAGE))
     client = OpenAI()
@@ -183,7 +183,7 @@ def setup_logging():
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.handlers = [sh, fh]
 
-# ---------- Konzistenční pojistka ----------
+# ---------- Consistency Guard ----------
 def consistency_guard(req: DecisionRequest, res: DecisionResponse) -> DecisionResponse:
     dsl = days_since(req.last_watering_date) or 999
     temp = req.weather_now.temp_c
@@ -201,7 +201,7 @@ def consistency_guard(req: DecisionRequest, res: DecisionResponse) -> DecisionRe
         res.oduvodneni = f"{dsl} d od zálivky, {temp:.0f}°C/{int(rh)}% RH, déšť <2 mm/12h → raději zalij."
     return res
 
-# ---------- Hlavní ----------
+# ---------- Main ----------
 def main():
     setup_logging()
 
@@ -209,14 +209,14 @@ def main():
         logging.error("Chybí OPENAI_API_KEY v prostředí.")
         sys.exit(1)
 
-    # obrázek → data URL
+    # picture → data URL
     try:
         image_data_url = file_to_data_url(IMAGE_PATH)
     except Exception as e:
         logging.error("Chyba při čtení obrázku: %s", e)
         sys.exit(1)
 
-    # JSON vstupy
+    # JSON inputs
     try:
         weather_now_raw = load_json_or_default(WEATHER_NOW_PATH, None, required=True)
         weather_forecast_raw = load_json_or_default(WEATHER_FORECAST_PATH, None, required=True)
@@ -225,7 +225,7 @@ def main():
     except Exception as e:
         logging.error("Chyba při načítání JSON: %s", e); sys.exit(1)
 
-    # validace + “poslední zálivka”
+    # validation + “last watered”
     try:
         wn = WeatherNow(**weather_now_raw)
         wf = WeatherForecast(**weather_forecast_raw)
@@ -255,10 +255,10 @@ def main():
     except Exception as e:
         logging.error("Chyba volání OpenAI: %s", e); sys.exit(1)
 
-    # konzistenční pojistka
+    # kconsistency_guard
     # res = consistency_guard(req, res)
 
-    # výstup
+    # output
     print(json.dumps(res.model_dump(), ensure_ascii=False, indent=2))
     logging.info("RESPONSE: %s", json.dumps(res.model_dump(), ensure_ascii=False))
 
