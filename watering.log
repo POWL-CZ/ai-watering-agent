@@ -1,27 +1,4 @@
-2025-09-18 22:55:35,161 [INFO] PROMPT_MESSAGES:
-[
-  {
-    "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "Poslední zálivka: 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: neznámý\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
-      },
-      {
-        "type": "image_url",
-        "image_url": {
-          "url": "<image-data-url-redacted>"
-        }
-      }
-    ]
-  }
-]
-2025-09-18 22:55:39,546 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 22:55:39,555 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla zalita včera a aktuální počasí je teplé a suché, což naznačuje, že by mohla mít dostatek vody."}
+
 2025-09-18 23:01:40,547 [INFO] PROMPT_MESSAGES:
 [
   {
@@ -70,27 +47,3 @@
 ]
 2025-09-18 23:02:22,091 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
 2025-09-18 23:02:22,104 [INFO] RESPONSE: {"zalevat": true, "oduvodneni": "Rostliny potřebují vodu při vysokých teplotách a nízké vlhkosti, navíc poslední zálivka byla před třemi dny."}
-2025-09-18 23:03:45,592 [INFO] PROMPT_MESSAGES:
-[
-  {
-    "role": "system",
-    "content": "Dnes je 2025-09-18. Rozhodni, zda **dnes** zalít rostlinu. Máš fotku, datum/objem poslední zálivky, aktuální počasí a krátkodobou předpověď. Odpověz **pouze** jako JSON přesně tohoto tvaru: {\"zalevat\": <true|false>, \"oduvodneni\": \"<stručné odůvodnění v češtině>\"}"
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "Poslední zálivka: 2025-09-17T09:30:00 (3000 ml)\n\nKontext rostliny: {\"species\":\"rajčata\",\"notes\":\"ve skleníku\"}\n\nAktuální počasí: {'temp_c': 32.0, 'humidity_pct': 30.0, 'precipitation_mm': 0.0, 'cloudcover_pct': 0.0, 'description': 'slunecno'}\n\nPředpověď (prvních 12 záznamů): [{'time': datetime.datetime(2025, 9, 19, 12, 0), 'precip_prob_pct': 20.0, 'expected_precip_mm': 0.0, 'temp_c': 24.0, 'humidity_pct': 50.0}, {'time': datetime.datetime(2025, 9, 19, 18, 0), 'precip_prob_pct': 35.0, 'expected_precip_mm': 0.0, 'temp_c': 20.0, 'humidity_pct': 65.0}]"
-      },
-      {
-        "type": "image_url",
-        "image_url": {
-          "url": "<image-data-url-redacted>"
-        }
-      }
-    ]
-  }
-]
-2025-09-18 23:03:50,350 [INFO] HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-2025-09-18 23:03:50,359 [INFO] RESPONSE: {"zalevat": false, "oduvodneni": "Rostlina byla naposledy zalita včera a aktuální počasí je velmi teplé a suché, což naznačuje, že by mohla být dostatečně zavlažena."}
