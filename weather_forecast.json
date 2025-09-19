@@ -2,14 +2,14 @@
   "horizon_hours": 48,
   "items": [
     {
-      "time": "2025-09-18T12:00:00",
+      "time": "2025-09-19T12:00:00",
       "precip_prob_pct": 100,
       "expected_precip_mm": 30.0,
       "temp_c": 16,
       "humidity_pct": 80
     },
     {
-      "time": "2025-09-18T18:00:00",
+      "time": "2025-09-19T18:00:00",
       "precip_prob_pct": 100,
       "expected_precip_mm": 30.0,
       "temp_c": 16,
